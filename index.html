@@ -1,0 +1,280 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>写真マップ（検索・分類・範囲選択）</title>
+
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin=""/>
+<link rel="stylesheet" href="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.css" crossorigin=""/>
+
+<style>
+  html, body { height: 100%; margin: 0; font-family: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans JP", sans-serif; }
+  .wrap { display:flex; height:100%; }
+  #map { flex: 1 1 auto; }
+  .panel { width: 420px; max-width: 48vw; border-left: 1px solid #ddd; overflow:auto; padding: 10px 12px; box-sizing:border-box; background:#fff; }
+  .top { position: sticky; top: 0; background: white; padding-bottom: 10px; border-bottom: 1px solid #eee; z-index: 2; }
+  .search { width: 100%; padding: 8px 10px; font-size: 14px; box-sizing:border-box; }
+  .filters { display:flex; gap:8px; margin-top: 8px; }
+  .filters select { flex:1; padding: 7px 8px; }
+  .hint { color:#666; font-size: 12px; margin: 8px 0 0; line-height:1.4; }
+  .status { margin-top: 8px; font-size: 12px; color:#444; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+  .btn { border:1px solid #ddd; background:#fafafa; padding:4px 8px; border-radius:8px; cursor:pointer; }
+  .btn:hover { background:#f3f3f3; }
+  .item { display:flex; gap:10px; padding: 10px 4px; border-bottom:1px solid #f0f0f0; cursor:pointer; border-radius: 8px; }
+  .item:hover { background:#fafafa; }
+  .thumb { width: 92px; height: 68px; object-fit: cover; border-radius: 8px; border:1px solid #eee; }
+  .meta { flex:1; min-width:0; }
+  .id { font-weight:700; }
+  .small { color:#666; font-size: 12px; white-space: nowrap; overflow:hidden; text-overflow: ellipsis; }
+  .cap { font-size: 13px; margin-top: 4px; color:#222; overflow:hidden; text-overflow: ellipsis; display:-webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .badge { display:inline-block; font-size:11px; padding:2px 8px; border:1px solid #ddd; border-radius: 999px; margin-left:6px; color:#444; }
+  .popup img { width: 260px; height: auto; border-radius: 10px; border:1px solid #eee; }
+  .popup .p-title { font-weight:700; margin: 6px 0 4px; }
+  .popup .p-meta { font-size: 12px; color:#666; }
+  .popup .p-cap { margin-top: 6px; font-size: 13px; }
+</style>
+</head>
+
+<body>
+<div class="wrap">
+  <div id="map"></div>
+  <div class="panel">
+    <div class="top">
+      <input id="q" class="search" placeholder="検索（キャプション/日時/ファイル名）"/>
+      <div class="filters">
+        <select id="type">
+          <option value="">Type: 全部</option>
+        </select>
+        <select id="sort">
+          <option value="id">並び: 番号</option>
+          <option value="datetime">並び: 日時</option>
+        </select>
+      </div>
+      <div class="hint">
+        <b>矩形選択</b>：地図左上の四角アイコン（□）→ドラッグで範囲指定。<br/>
+        data.js の <b>caption</b> と <b>type</b> を編集 → 更新で反映。
+      </div>
+      <div class="status">
+        <span id="statusText">絞り込み：なし</span>
+        <span class="btn" id="clearBox" title="範囲選択を解除">範囲解除</span>
+      </div>
+    </div>
+    <div id="list"></div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script src="https://unpkg.com/leaflet-draw@1.0.4/dist/leaflet.draw.js" crossorigin=""></script>
+<script src="data.js"></script>
+
+<script>
+  // data.js は `const DATA = [...]`
+  const ALL = (typeof DATA !== 'undefined') ? DATA : [];
+
+  // --- Map ---
+  const map = L.map('map').setView([34.05, -118.25], 10);
+  L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+
+  // --- Color-coded icons by type ---
+  // 好みで type 名は data.js 側で統一してください
+// --- Color-coded icons by type (Nagasaki Offshore Wind) ---
+  const iconByType = {
+    "WindTurbine":  L.divIcon({html: pill("W", "#1f77b4"), className:""}), // turbine / wind farm
+    "Port":         L.divIcon({html: pill("P", "#ff7f0e"), className:""}), // port
+    "AssemblyYard": L.divIcon({html: pill("A", "#2ca02c"), className:""}), // assembly / manufacturing yard
+    "OandMBase":    L.divIcon({html: pill("O", "#d62728"), className:""}), // O&M base
+    "Substation":   L.divIcon({html: pill("S", "#9467bd"), className:""}), // substation
+    "Cable":        L.divIcon({html: pill("C", "#8c564b"), className:""}), // cable / landfall
+    "Vessel":       L.divIcon({html: pill("V", "#17becf"), className:""}), // vessel
+    "Viewpoint":    L.divIcon({html: pill("👁", "#7f7f7f"), className:""}), // viewpoint
+    "Meeting":      L.divIcon({html: pill("M", "#bcbd22"), className:""})  // interview / meeting
+  };
+
+
+  function pill(letter, color){
+    return `<div style="
+      background:${color};
+      color:white;
+      border-radius:999px;
+      padding:4px 9px;
+      font-weight:800;
+      border:2px solid white;
+      box-shadow:0 2px 8px rgba(0,0,0,.18);
+      line-height:1;
+      transform: translateY(-2px);
+    ">${letter}</div>`;
+  }
+
+  // --- Range selection (rectangle) ---
+  const drawnItems = new L.FeatureGroup();
+  map.addLayer(drawnItems);
+
+  const drawControl = new L.Control.Draw({
+    draw: { polyline:false, polygon:false, circle:false, marker:false, circlemarker:false, rectangle:true },
+    edit: { featureGroup: drawnItems, edit: false, remove: true }
+  });
+  map.addControl(drawControl);
+
+  let boxBounds = null; // L.LatLngBounds or null
+
+  map.on(L.Draw.Event.CREATED, function (e) {
+    drawnItems.clearLayers();
+    drawnItems.addLayer(e.layer);
+    boxBounds = e.layer.getBounds();
+    apply(); // apply filters + bounds
+  });
+
+  map.on(L.Draw.Event.DELETED, function () {
+    boxBounds = null;
+    apply();
+  });
+
+  document.getElementById("clearBox").onclick = () => {
+    drawnItems.clearLayers();
+    boxBounds = null;
+    apply();
+  };
+
+  // --- Markers management ---
+  const markerLayer = L.layerGroup().addTo(map);
+  const markers = new Map(); // id -> marker
+
+  function popupHtml(it) {
+    const cap = (it.caption || '').trim();
+    const type = (it.type || '').trim();
+    const badge = type ? `<span class="badge">${type}</span>` : '';
+    const alt = (it.alt_m !== null && it.alt_m !== undefined) ? ` / ${Number(it.alt_m).toFixed(1)}m` : '';
+    const dt = it.datetime || '';
+    return `
+      <div class="popup">
+        <img src="${it.thumb}" alt="thumb"/>
+        <div class="p-title">#${it.id}${badge}</div>
+        <div class="p-meta">${dt} / ${it.lat.toFixed(6)}, ${it.lon.toFixed(6)}${alt}</div>
+        <div class="p-cap">${cap ? cap : '<i style="color:#666">（キャプションなし）</i>'}</div>
+        <div style="margin-top:8px;font-size:12px;">
+          <a href="${
+            (it.kind === 'video')
+              ? it.url
+              : (it.path || it.file)
+          }" target="_blank" rel="noopener">原寸を開く</a>
+
+        </div>
+      </div>`;
+  }
+
+  function ensureMarker(it) {
+    if (markers.has(it.id)) return markers.get(it.id);
+    const t = (it.type || "").trim();
+    const icon = iconByType[t] || null;
+    const m = L.marker([it.lat, it.lon], icon ? {icon} : undefined);
+    m.bindPopup(popupHtml(it), {maxWidth: 340});
+    markers.set(it.id, m);
+    return m;
+  }
+
+  function clearMarkersFromMap() {
+    markerLayer.clearLayers();
+  }
+
+  // --- UI Helpers ---
+function populateTypeOptions() {
+  const sel = document.getElementById('type');
+
+  // 長崎の推奨順（ここにないtypeは後で追加で出す）
+  const preferred = ["WindTurbine","Port","AssemblyYard","OandMBase","Substation","Cable","Vessel","Viewpoint","Meeting"];
+
+  const existing = Array.from(new Set(ALL.map(x => (x.type||'').trim()).filter(Boolean)));
+  const rest = existing.filter(t => !preferred.includes(t)).sort();
+  const types = preferred.filter(t => existing.includes(t)).concat(rest);
+
+  for (const t of types) {
+    const opt = document.createElement('option');
+    opt.value = t;
+    opt.textContent = t;
+    sel.appendChild(opt);
+  }
+}
+
+  function renderList(data) {
+    const list = document.getElementById('list');
+    list.innerHTML = '';
+    data.forEach(it => {
+      const div = document.createElement('div');
+      div.className = 'item';
+      const type = (it.type||'').trim();
+      const badge = type ? `<span class="badge">${type}</span>` : '';
+      div.innerHTML = `
+        <img class="thumb" src="${it.thumb}" alt="thumb"/>
+        <div class="meta">
+          <div><span class="id">#${it.id}</span>${badge}</div>
+          <div class="small">${(it.datetime||'') + ' / ' + (it.path || it.file || it.url || '')}</div>
+          <div class="cap">${(it.caption||'').trim() || '（キャプションなし）'}</div>
+        </div>`;
+      div.onclick = () => {
+        const m = ensureMarker(it);
+        map.setView([it.lat, it.lon], Math.max(map.getZoom(), 13));
+        m.openPopup();
+      };
+      list.appendChild(div);
+    });
+  }
+
+  function updateStatus(dataCount) {
+    const t = document.getElementById('type').value;
+    const q = (document.getElementById('q').value || '').trim();
+    const hasBox = !!boxBounds;
+    const parts = [];
+    if (q) parts.push(`検索="${q}"`);
+    if (t) parts.push(`Type=${t}`);
+    if (hasBox) parts.push(`範囲あり`);
+    const label = parts.length ? parts.join(" / ") : "なし";
+    document.getElementById('statusText').textContent = `絞り込み：${label}（${dataCount}件）`;
+  }
+
+  function apply() {
+    const q = (document.getElementById('q').value || '').toLowerCase();
+    const t = document.getElementById('type').value;
+    const sort = document.getElementById('sort').value;
+
+    let data = ALL.filter(it => {
+      if (t && (it.type||'') !== t) return false;
+
+      // range box
+      if (boxBounds && !boxBounds.contains([it.lat, it.lon])) return false;
+
+      // search blob
+      const blob = `${it.path} ${it.datetime||''} ${it.caption||''}`.toLowerCase();
+      if (q && !blob.includes(q)) return false;
+
+      return true;
+    });
+
+    if (sort === 'datetime') {
+      data.sort((a,b) => (a.datetime||'').localeCompare(b.datetime||''));
+    } else {
+      data.sort((a,b) => a.id - b.id);
+    }
+
+    // render markers & list
+    clearMarkersFromMap();
+    data.forEach(it => markerLayer.addLayer(ensureMarker(it)));
+    renderList(data);
+    updateStatus(data.length);
+
+    // fit bounds (only if there is data)
+    if (data.length) {
+      const bounds = L.latLngBounds(data.map(it => [it.lat, it.lon]));
+      map.fitBounds(bounds.pad(0.2));
+    }
+  }
+
+  // init
+  populateTypeOptions();
+  apply();
+  document.getElementById('q').addEventListener('input', apply);
+  document.getElementById('type').addEventListener('change', apply);
+  document.getElementById('sort').addEventListener('change', apply);
+</script>
+</body>
+</html>
